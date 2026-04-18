@@ -1,8 +1,16 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-// Anon key é pública por design (segura para uso no frontend)
-const SUPABASE_URL = "https://ccdxjncjmflgazxqvyqv.supabase.co";
-const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNjZHhqbmNqbWZsZ2F6eHF2eXF2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4MzEyNzMsImV4cCI6MjA5MDQwNzI3M30.wYL5QUVsyBcayKlUsIy3vCtlWY_rkKHSCsO_39HWwzc";
+let _client: SupabaseClient | null = null;
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+export const getLovableClient = () => _client;
+
+export function initLovableClient(url: string, key: string) {
+  _client = createClient(url, key);
+}
+
+export const supabase = new Proxy({} as SupabaseClient, {
+  get(_, prop) {
+    if (!_client) throw new Error("Cliente Lovable não inicializado. Verifique as configurações.");
+    return (_client as any)[prop];
+  },
+});

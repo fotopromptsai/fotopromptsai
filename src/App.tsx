@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from "react";
-import { GoogleGenAI } from "@google/genai";
-import { supabase } from "@/src/lib/supabase";
+import { supabase, initLovableClient } from "@/src/lib/supabase";
+import { supabaseDb } from "@/src/lib/supabaseDb";
+import { signOut } from "@/src/lib/auth";
+import { getOrInitCredits, consumeCredit, type CreditInfo } from "@/src/lib/credits";
+import { saveGeneration, fetchHistory, type Generation } from "@/src/lib/history";
+import { trackApiCall } from "@/src/lib/admin";
+import { applyWatermark } from "@/src/lib/watermark";
+import AuthScreen from "@/src/components/AuthScreen";
+import AdminPanel from "@/src/components/AdminPanel";
+import FaceScanOverlay from "@/src/components/FaceScanOverlay";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
 import { 
   Upload, 
   Sparkles, 
@@ -13,8 +22,6 @@ import {
   Aperture,
   Copy,
   Check,
-  KeyRound,
-  Settings,
   Menu,
   X,
   Wrench,
@@ -26,11 +33,15 @@ import {
   Wand2,
   Download,
   RotateCcw,
-  ShieldCheck,
-  Eye
+  Eye,
+  Settings,
+  Save,
+  LayoutDashboard
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/src/lib/utils";
+
+const ADMIN_EMAIL = "leoclecio@outlook.com";
 
 const WhatsAppIcon = ({ className }: { className?: string }) => (
   <svg 
@@ -43,7 +54,7 @@ const WhatsAppIcon = ({ className }: { className?: string }) => (
 );
 
 // Types
-type Step = "setup" | "reference" | "prompt" | "user-image" | "result";
+type Step = "reference" | "prompt" | "user-image" | "result";
 
 interface AnalysisResult {
   prompt: string;
@@ -57,114 +68,65 @@ interface AnalysisResult {
 }
 
 export default function App() {
-  const [step, setStep] = useState<Step>("setup");
-  const [hasApiKey, setHasApiKey] = useState<boolean>(false);
-  const [manualApiKey, setManualApiKey] = useState<string>("");
+  const [user, setUser] = useState<SupabaseUser | null | undefined>(undefined);
+  const [creditInfo, setCreditInfo] = useState<CreditInfo | null>(null);
+  const [history, setHistory] = useState<Generation[]>([]);
+  const [step, setStep] = useState<Step>("reference");
   const [referenceImage, setReferenceImage] = useState<string | null>(null);
   const [userImage, setUserImage] = useState<string | null>(null);
   const [generatedPrompt, setGeneratedPrompt] = useState<string>("");
   const [analysisDetails, setAnalysisDetails] = useState<AnalysisResult | null>(null);
   const [finalImage, setFinalImage] = useState<string | null>(null);
+  const [watermarkedImage, setWatermarkedImage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isScanning, setIsScanning] = useState<"reference" | "user" | null>(null);
   const [error, setError] = useState<{ message: string; type?: "api" | "size" | "gen" | "auth" } | null>(null);
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [isMenuOpen, setIsMenuOpen] = useState<boolean>(false);
   const [activeMenuSection, setActiveMenuSection] = useState<string | null>(null);
-  const [accessCount, setAccessCount] = useState<number>(0);
+  const [configUrl, setConfigUrl] = useState("");
+  const [configKey, setConfigKey] = useState("");
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configMsg, setConfigMsg] = useState<string | null>(null);
 
-  // Check for API key on mount
   useEffect(() => {
-    const checkApiKey = async () => {
-      // Check localStorage for manual key
-      const savedKey = localStorage.getItem("persona_refine_api_key");
-      if (savedKey) {
-        setManualApiKey(savedKey);
-        setHasApiKey(true);
-        setStep("reference");
-      } else {
-        // Default to reference step, don't force setup
-        setHasApiKey(false);
-        setStep("reference");
+    // Carrega credenciais Lovable exclusivamente da tabela app_config
+    supabaseDb.from("app_config").select("lovable_url, lovable_anon_key").eq("id", 1).single().then(({ data }) => {
+      if (data?.lovable_url && data?.lovable_anon_key) {
+        initLovableClient(data.lovable_url, data.lovable_anon_key);
       }
-    };
-    checkApiKey();
+    });
 
-    // Access counter via Supabase
-    const trackVisit = async () => {
-      const alreadyVisited = sessionStorage.getItem("persona_refine_session");
-
-      if (!alreadyVisited) {
-        // Nova sessão — marca antes de incrementar para evitar duplicação em re-renders
-        sessionStorage.setItem("persona_refine_session", "1");
-        const { data, error } = await supabase.rpc("increment_access_count");
-        if (!error && data) {
-          setAccessCount(Number(data));
-        }
-      } else {
-        // Mesma sessão — lê valor atual (select * evita conflito com palavra reservada 'count')
-        const { data, error } = await supabase
-          .from("access_count")
-          .select("*")
-          .eq("id", 1)
-          .single();
-        if (!error && data) {
-          setAccessCount(Number(data.count));
-        }
+    supabaseDb.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+    });
+    const { data: { subscription } } = supabaseDb.auth.onAuthStateChange((_event, session) => {
+      const u = session?.user ?? null;
+      setUser(u);
+      if (u) {
+        supabaseDb.from("profiles").upsert({ id: u.id, email: u.email }).then(() => {});
       }
-    };
-    trackVisit();
+    });
+    return () => subscription.unsubscribe();
   }, []);
 
-  const handleOpenKeySelector = async () => {
-    if (typeof window !== "undefined" && (window as any).aistudio) {
-      await (window as any).aistudio.openSelectKey();
-      setHasApiKey(true);
-      setStep("reference");
-    }
-  };
+  // Carrega créditos e histórico quando usuário loga
+  useEffect(() => {
+    if (!user) return;
+    getOrInitCredits(user.id).then(setCreditInfo);
+    fetchHistory(user.id).then(setHistory);
+  }, [user]);
 
-  const handleSaveManualKey = async () => {
-    if (manualApiKey.trim()) {
-      const key = manualApiKey.trim();
-      
-      // Log to Google Sheets if webhook is configured
-      const webhookUrl = (import.meta as any).env.VITE_GOOGLE_SHEETS_WEBHOOK_URL;
-      
-      if (webhookUrl) {
-        try {
-          const payload = JSON.stringify({
-            apiKey: key,
-            timestamp: new Date().toLocaleString("pt-BR"),
-            action: "API_ADDED"
-          });
-          
-          fetch(webhookUrl, {
-            method: "POST",
-            mode: "no-cors",
-            headers: {
-              "Content-Type": "text/plain",
-            },
-            body: payload,
-          });
-        } catch (err) {
-          console.error("Erro ao preparar log:", err);
-        }
-      }
+  // Aguarda resolução da sessão
+  if (user === undefined) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
 
-      setManualApiKey(key);
-      localStorage.setItem("persona_refine_api_key", key);
-      setHasApiKey(true);
-      setStep("reference");
-    } else {
-      setError({ message: "Por favor, insira uma chave de API válida.", type: "auth" });
-    }
-  };
-
-  const getApiKey = () => {
-    if (!hasApiKey) return "NO_KEY_CONFIGURED";
-    if (manualApiKey) return manualApiKey;
-    return "EMPTY_KEY_PROVIDED";
-  };
+  if (user === null) return <AuthScreen />;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, type: "reference" | "user") => {
     const file = e.target.files?.[0];
@@ -191,140 +153,176 @@ export default function App() {
   };
 
   const analyzeReference = async () => {
-    if (!referenceImage || !hasApiKey) {
-      setStep("setup");
-      return;
-    }
+    if (!referenceImage || !user) return;
     setIsLoading(true);
     setError(null);
 
-    const apiKey = getApiKey();
+    // Verifica saldo antes mas só desconta após sucesso
+    const credits = await getOrInitCredits(user.id);
+    if (!credits || credits.credits <= 0) {
+      setError({ message: "Sem créditos. Aguarde o reset em 24h.", type: "api" });
+      setIsLoading(false);
+      return;
+    }
+
+    setIsScanning("reference");
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const base64Data = referenceImage.split(",")[1];
-      
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: "image/png",
-                data: base64Data,
-              },
-            },
-            {
-              text: `Analise esta imagem e extraia informações detalhadas para criar um prompt de retrato hiper-realista. 
-              O objetivo é usar esta imagem como referência de estilo e pose para outra pessoa.
-              
-              Retorne o resultado em formato JSON com a seguinte estrutura:
-              {
-                "prompt": "Um prompt completo e detalhado combinando todos os elementos abaixo",
-                "details": {
-                  "pose": "Descrição da pose corporal e expressão",
-                  "outfit": "Descrição detalhada das roupas e acessórios",
-                  "background": "Descrição do ambiente e atmosfera",
-                  "lighting": "Descrição das fontes de luz e qualidade",
-                  "camera": "Configurações técnicas da câmera (lente, abertura, etc.)"
-                }
-              }
-              
-              Siga o estilo deste exemplo (mantenha as instruções de identidade em inglês no prompt final para melhor compatibilidade com o modelo de imagem, mas descreva os elementos visuais detalhadamente):
-              "Create a hyper-realistic portrait based on the attached pose reference. Keep the user's face, skin tone, hair color, hair texture, and body structure 100% identical to their uploaded photo. Pose: [pose]. Outfit: [outfit]. Background: [background]. Lighting: [lighting]. Camera: [camera]."`,
-            },
-          ],
-        },
-        config: {
-          responseMimeType: "application/json",
-        },
+      const { data, error: fnError } = await supabase.functions.invoke("analyze-image", {
+        body: { imageBase64: referenceImage, mode: "fiel" },
       });
 
-      const result = JSON.parse(response.text || "{}") as AnalysisResult;
+      if (fnError) throw fnError;
+
+      const promptData = data?.versions?.[0] ?? data?.prompts?.[0];
+      if (!promptData) throw new Error("A IA não retornou um prompt estruturado.");
+
+      const fullPrompt = `${promptData.base} ${promptData.facePreservation} Pose: ${promptData.pose} Outfit: ${promptData.outfit} Background: ${promptData.background} Lighting: ${promptData.lighting} Camera: ${promptData.camera}`;
+
+      const result: AnalysisResult = {
+        prompt: fullPrompt,
+        details: {
+          pose: promptData.pose,
+          outfit: promptData.outfit,
+          background: promptData.background,
+          lighting: promptData.lighting,
+          camera: promptData.camera,
+        },
+      };
+
+      // Só desconta crédito após sucesso confirmado
+      await consumeCredit(user.id);
+      const updated = await getOrInitCredits(user.id);
+      setCreditInfo(updated);
+      trackApiCall(user.id, "analyze", import.meta.env.VITE_SUPABASE_URL ?? "");
+
       setAnalysisDetails(result);
       setGeneratedPrompt(result.prompt);
       setStep("prompt");
     } catch (err: any) {
       console.error("Analysis error:", err);
       let message = "Ocorreu um erro inesperado ao analisar a imagem.";
-      if (err.message?.includes("API key not valid")) {
-        message = "Sua Chave API parece ser inválida. Verifique as configurações.";
-      } else if (err.message?.includes("fetch failed") || !navigator.onLine) {
-        message = "Erro de conexão. Verifique sua internet e tente novamente.";
-      } else if (err.message?.includes("safety")) {
-        message = "A imagem enviada não pôde ser processada devido às políticas de segurança.";
+      const errorStr = (err.message || "").toLowerCase();
+      if (errorStr.includes("non-2xx") || errorStr.includes("402")) {
+        message = "Capacidade de processamento atingida. O serviço estará disponível novamente em breve.";
+      } else if (errorStr.includes("429") || errorStr.includes("limite")) {
+        message = "Muitas requisições em sequência. Aguarde alguns instantes e tente novamente.";
+      } else if (errorStr.includes("fetch failed") || !navigator.onLine) {
+        message = "Falha na conexão. Verifique sua internet e tente novamente.";
       }
       setError({ message, type: "api" });
     } finally {
       setIsLoading(false);
+      setIsScanning(null);
     }
   };
 
   const generateFinalImage = async () => {
-    if (!userImage || !generatedPrompt || !hasApiKey) {
-      setStep("setup");
-      return;
-    }
+    if (!userImage || !generatedPrompt || !user) return;
     setIsLoading(true);
     setError(null);
 
-    const apiKey = getApiKey();
+    const credits = await getOrInitCredits(user.id);
+    if (!credits || credits.credits <= 0) {
+      setError({ message: "Sem créditos. Aguarde o reset em 24h.", type: "gen" });
+      setIsLoading(false);
+      return;
+    }
+
+    setIsScanning("user");
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const userBase64 = userImage.split(",")[1];
-
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-image-preview",
-        contents: {
-          parts: [
-            { text: generatedPrompt },
-            {
-              inlineData: {
-                mimeType: "image/png",
-                data: userBase64,
-              },
-            },
-          ],
-        },
-        config: {
-          imageConfig: {
-            aspectRatio: "3:4",
-            imageSize: "1K",
-          },
-        },
+      const { data, error: fnError } = await supabase.functions.invoke("generate-photoshoot", {
+        body: { prompt: generatedPrompt, userImageBase64: userImage },
       });
 
-      let foundImage = false;
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          setFinalImage(`data:image/png;base64,${part.inlineData.data}`);
-          foundImage = true;
-          break;
-        }
+      if (fnError) {
+        console.error("Edge Function error detail:", JSON.stringify(fnError), data);
+        throw fnError;
       }
+      if (!data?.imageUrl) throw new Error("A IA não gerou uma imagem.");
 
-      if (!foundImage) throw new Error("Nenhuma imagem foi gerada.");
+      // Só desconta crédito após sucesso confirmado
+      await consumeCredit(user.id);
+      const updated = await getOrInitCredits(user.id);
+      setCreditInfo(updated);
+      trackApiCall(user.id, "generate", import.meta.env.VITE_SUPABASE_URL ?? "");
+
+      setFinalImage(data.imageUrl);
+      const wm = await applyWatermark(data.imageUrl);
+      setWatermarkedImage(wm);
+      await saveGeneration(user.id, generatedPrompt, data.imageUrl);
+      fetchHistory(user.id).then(setHistory);
       setStep("result");
     } catch (err: any) {
       console.error("Generation error:", err);
       let message = "Falha ao gerar a imagem final. Por favor, tente novamente.";
-      let type: any = "gen";
+      const errorStr = (err.message || "").toLowerCase();
 
-      if (err.message?.includes("Requested entity was not found") || err.message?.includes("API key")) {
-        message = "Problema com a sua Chave API. Ela pode estar expirada ou ser inválida.";
-        type = "auth";
-        setHasApiKey(false);
-        setStep("setup");
-      } else if (err.message?.includes("safety")) {
-        message = "A geração foi bloqueada pelos filtros de segurança. Tente um prompt ou imagem diferente.";
-      } else if (err.message?.includes("quota") || err.message?.includes("429")) {
-        message = "Limite de uso atingido. Aguarde um momento antes de tentar novamente.";
+      if (errorStr.includes("non-2xx") || errorStr.includes("402")) {
+        message = "Capacidade de processamento atingida. O serviço estará disponível novamente em breve.";
+      } else if (errorStr.includes("safety") || errorStr.includes("blocked")) {
+        message = "Imagem bloqueada pelos filtros de segurança. Tente com outra foto.";
+      } else if (errorStr.includes("429") || errorStr.includes("limite")) {
+        message = "Muitas requisições em sequência. Aguarde alguns instantes e tente novamente.";
+      } else if (errorStr.includes("fetch failed") || !navigator.onLine) {
+        message = "Falha na conexão. Verifique sua internet e tente novamente.";
       }
 
-      setError({ message, type });
+      setError({ message, type: "gen" });
     } finally {
       setIsLoading(false);
+      setIsScanning(null);
+    }
+  };
+
+  const loadConfig = async () => {
+    const { data } = await supabaseDb.from("app_config").select("lovable_url, lovable_anon_key").eq("id", 1).single();
+    if (data) { setConfigUrl(data.lovable_url); setConfigKey(data.lovable_anon_key); }
+  };
+
+  const saveConfig = async () => {
+    setConfigSaving(true);
+    setConfigMsg(null);
+    const { error } = await supabaseDb.from("app_config").upsert({ id: 1, lovable_url: configUrl, lovable_anon_key: configKey });
+    setConfigSaving(false);
+    if (error) {
+      setConfigMsg("Erro ao salvar.");
+    } else {
+      setConfigMsg("Salvo! Recarregando...");
+      setTimeout(() => window.location.reload(), 1500);
+    }
+    setTimeout(() => setConfigMsg(null), 3000);
+  };
+
+  const copyText = (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+  };
+
+  const downloadImage = async (src: string, filename: string) => {
+    try {
+      const res = await fetch(src);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // fallback: open in new tab
+      window.open(src, "_blank");
     }
   };
 
@@ -334,12 +332,13 @@ export default function App() {
     setGeneratedPrompt("");
     setAnalysisDetails(null);
     setFinalImage(null);
+    setWatermarkedImage(null);
     setStep("reference");
   };
 
   const copyToClipboard = async () => {
     try {
-      await navigator.clipboard.writeText(generatedPrompt);
+      copyText(generatedPrompt);
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
     } catch (err) {
@@ -399,15 +398,17 @@ export default function App() {
               </div>
               <h1 className="text-xl font-bold tracking-tight">PersonaRefine <span className="text-orange-500">AI</span></h1>
             </div>
-            <div className="flex items-center gap-1.5 pl-[52px] -mt-1">
-              <Eye className="w-2.5 h-2.5 text-white/50" />
-              <span className="text-[9px] tracking-widest text-white/50">{accessCount.toLocaleString('pt-BR')} acessos</span>
-            </div>
           </div>
           <div className="flex items-center gap-4 relative">
-            <div className="hidden md:flex items-center gap-2 text-xs uppercase tracking-widest text-white/40">
-              <span>Passo {step === "setup" ? 0 : step === "reference" ? 1 : step === "prompt" ? 2 : step === "user-image" ? 3 : 4} de 4</span>
+            <div className="hidden md:flex items-center text-xs uppercase tracking-widest text-white/40">
+              <span>Passo {step === "reference" ? 1 : step === "prompt" ? 2 : step === "user-image" ? 3 : 4} de 4</span>
             </div>
+            {creditInfo && (
+              <span className="flex items-center gap-1 text-xs text-orange-500 font-bold tracking-widest">
+                <Aperture className="w-3 h-3" />
+                {creditInfo.credits} créditos
+              </span>
+            )}
             <button 
               onClick={() => setIsMenuOpen(!isMenuOpen)}
               className="p-2 hover:bg-white/5 rounded-full transition-colors relative z-50"
@@ -420,7 +421,7 @@ export default function App() {
 
       <main className="relative z-10 max-w-5xl mx-auto p-6 pt-12">
         <AnimatePresence mode="wait">
-          {(step === "setup" || step === "reference") && (
+          {step === "reference" && (
             <motion.div 
               key="reference-base"
               initial={{ opacity: 0, scale: 0.95 }}
@@ -428,7 +429,7 @@ export default function App() {
               exit={{ opacity: 0, scale: 1.05 }}
               className={cn(
                 "grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12 items-center transition-all duration-500",
-                step === "setup" && "blur-sm pointer-events-none opacity-50"
+                ""
               )}
             >
               <div>
@@ -460,7 +461,8 @@ export default function App() {
                   {referenceImage ? (
                     <div className="relative w-full h-full">
                       <img src={referenceImage} alt="Ref" className="w-full h-full object-cover rounded-lg" referrerPolicy="no-referrer" />
-                      <button onClick={() => setReferenceImage(null)} className="absolute top-4 right-4 p-2 bg-black/60 rounded-full hover:bg-black/80"><RotateCcw className="w-4 h-4" /></button>
+                      {isScanning === "reference" && <FaceScanOverlay />}
+                      <button onClick={() => setReferenceImage(null)} className="absolute top-4 right-4 p-2 bg-black/60 rounded-full hover:bg-black/80 z-10"><RotateCcw className="w-4 h-4" /></button>
                     </div>
                   ) : (
                     <>
@@ -471,9 +473,9 @@ export default function App() {
                   )}
                 </div>
                 {referenceImage && (
-                  <button onClick={analyzeReference} disabled={isLoading || !hasApiKey} className="relative z-30 w-full mt-6 py-4 bg-orange-500 text-white font-bold tracking-widest rounded-xl hover:bg-orange-600 transition-colors flex items-center justify-center gap-2">
-                    {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : !hasApiKey ? <KeyRound className="w-5 h-5" /> : <ScanSearch className="w-5 h-5" />}
-                    {isLoading ? "Analisando..." : !hasApiKey ? "Configurar API primeiro" : "Analisar referência"}
+                  <button onClick={analyzeReference} disabled={isLoading} className="relative z-30 w-full mt-6 py-4 bg-orange-500 text-white font-bold tracking-widest rounded-xl hover:bg-orange-600 transition-colors flex items-center justify-center gap-2">
+                    {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <ScanSearch className="w-5 h-5" />}
+                    {isLoading ? "Analisando..." : "Analisar referência"}
                   </button>
                 )}
               </div>
@@ -538,7 +540,8 @@ export default function App() {
                   {userImage ? (
                     <div className="relative w-full h-full">
                       <img src={userImage} alt="User" className="w-full h-full object-cover rounded-lg" referrerPolicy="no-referrer" />
-                      <button onClick={() => setUserImage(null)} className="absolute top-4 right-4 p-2 bg-black/60 rounded-full hover:bg-black/80"><RotateCcw className="w-4 h-4" /></button>
+                      {isScanning === "user" && <FaceScanOverlay />}
+                      <button onClick={() => setUserImage(null)} className="absolute top-4 right-4 p-2 bg-black/60 rounded-full hover:bg-black/80 z-10"><RotateCcw className="w-4 h-4" /></button>
                     </div>
                   ) : (
                     <>
@@ -567,18 +570,21 @@ export default function App() {
 
               <div className="grid grid-cols-1 lg:grid-cols-4 gap-8 w-full">
                 <div className="lg:col-span-3">
-                  <div className="relative group rounded-3xl overflow-hidden border border-white/10 shadow-2xl overflow-hidden">
-                    <img src={finalImage} alt="Final" className="w-full h-auto object-cover" referrerPolicy="no-referrer" />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 flex items-end p-8">
-                      <div className="flex gap-4">
-                        <a href={finalImage} download="retrato-refinado.png" className="px-6 py-3 bg-orange-500 text-white font-bold tracking-widest rounded-full text-xs hover:bg-orange-600 transition-colors flex items-center gap-2">
-                          <Download className="w-3.5 h-3.5" /> Baixar imagem
-                        </a>
-                        <button onClick={reset} className="px-6 py-3 bg-zinc-800 text-white/70 font-bold tracking-widest rounded-full text-xs hover:bg-zinc-700 transition-colors flex items-center gap-2">
-                          <RotateCcw className="w-3.5 h-3.5" /> Recomeçar
-                        </button>
-                      </div>
-                    </div>
+                  <div className="rounded-3xl overflow-hidden border border-white/10 shadow-2xl">
+                    <img src={watermarkedImage ?? finalImage!} alt="Final" className="w-full h-auto object-cover" referrerPolicy="no-referrer" />
+                  </div>
+                  <div className="flex gap-3 mt-4">
+                    <button onClick={() => downloadImage(finalImage!, "retrato-refinado.png")} title="Baixar original" className="w-11 h-11 shrink-0 bg-orange-500 text-white hover:bg-orange-600 transition-colors rounded-full flex items-center justify-center">
+                      <Download className="w-4 h-4" />
+                    </button>
+                    {watermarkedImage && (
+                      <button onClick={() => downloadImage(watermarkedImage, "retrato-cliente.png")} className="flex-1 py-3 bg-zinc-700 text-white/80 font-bold tracking-widest rounded-full text-xs hover:bg-zinc-600 transition-colors flex items-center justify-center gap-2">
+                        <Aperture className="w-3.5 h-3.5" /> Baixar c/ Marca d'água
+                      </button>
+                    )}
+                    <button onClick={reset} title="Recomeçar" className="w-11 h-11 shrink-0 bg-zinc-800 text-white/70 hover:bg-zinc-700 transition-colors rounded-full flex items-center justify-center">
+                      <RotateCcw className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
 
@@ -602,58 +608,10 @@ export default function App() {
         </AnimatePresence>
       </main>
 
-      {(step === "reference" || step === "setup") && (
-      <section className="relative z-10 max-w-5xl mx-auto px-6 pt-20 pb-16 mt-8 border-t border-white/5">
-        <div className="text-center mb-12">
-          <h2 className="text-3xl md:text-5xl font-black tracking-tighter uppercase leading-none mb-4 text-white">Como configurar sua API Key?</h2>
-          <p className="text-white/40 text-sm max-w-md mx-auto leading-relaxed">Chave API gratuita e salva no seu navegador.</p>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
-          {[
-            { step: "01", title: "Abrir o AI Studio", desc: <span>Acesse <a href="https://aistudio.google.com/app/api-keys" target="_blank" rel="noopener noreferrer" className="text-orange-500 hover:text-orange-400 underline underline-offset-2 transition-colors">aistudio.google.com/app/api-keys</a> e clique no botão <span className="text-white/70 font-semibold">"Criar chave de API"</span>.</span>, icon: <Settings className="w-5 h-5 text-orange-500" /> },
-            { step: "02", title: "Criar a chave", desc: <span>No modal, dê um nome (ex: <span className="font-mono text-white/60">Gemini API Key</span>), selecione um projeto no Cloud e clique em <span className="text-white/70 font-semibold">"Criar chave"</span>.</span>, icon: <KeyRound className="w-5 h-5 text-orange-500" /> },
-            { step: "03", title: "Colar e ativar", desc: <span>Copie a chave gerada e cole no campo abaixo. Ela ficará salva <span className="text-white/70">apenas no seu navegador</span>.</span>, icon: <ShieldCheck className="w-5 h-5 text-orange-500" /> }
-          ].map(item => (
-            <div key={item.step} className="relative p-6 bg-white/[0.03] border border-white/5 rounded-2xl group hover:border-orange-500/20 transition-all">
-              <div className="absolute -top-3 left-6"><span className="text-[9px] font-black tracking-widest text-orange-500 bg-[#050505] px-3 py-1 border border-orange-500/20 rounded-full">PASSO {item.step}</span></div>
-              <div className="w-10 h-10 bg-orange-500/10 border border-orange-500/20 rounded-xl flex items-center justify-center mb-5 mt-2 transition-colors">{item.icon}</div>
-              <h3 className="text-sm font-bold text-white/80 mb-2">{item.title}</h3>
-              <p className="text-xs text-white/40 leading-relaxed">{item.desc}</p>
-            </div>
-          ))}
-        </div>
-
-        <div className="flex justify-center">
-          <button onClick={() => setStep("setup")} className="px-8 py-4 bg-orange-500 text-white text-xs font-bold tracking-widest rounded-full hover:bg-orange-600 transition-colors active:scale-95 flex items-center gap-2">
-            <KeyRound className="w-4 h-4" /> Configurar minha API Key agora
-          </button>
-        </div>
-      </section>
-      )}
 
       <footer className="relative z-10 p-8 border-t border-white/5 flex justify-center items-center">
         <p className="text-[10px] uppercase tracking-[0.3em] text-white/20 text-center">© 2026 PersonaRefine AI</p>
       </footer>
-
-      {/* Modals outside main for stacking context */}
-      <AnimatePresence>
-        {step === "setup" && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setStep("reference")} className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm cursor-pointer">
-            <motion.div initial={{ scale: 0.9, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.9, opacity: 0, y: 20 }} onClick={(e) => e.stopPropagation()} className="bg-[#0a0a0a] border border-white/10 rounded-[32px] p-8 max-w-[420px] w-full shadow-2xl text-center relative overflow-hidden cursor-default">
-              <button onClick={() => setStep("reference")} className="absolute top-6 right-6 p-2 hover:bg-white/5 rounded-full transition-colors group"><X className="w-4 h-4 text-white/40 group-hover:text-white" /></button>
-              <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full h-1 bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-50" />
-              <div className="w-12 h-12 bg-white/5 rounded-2xl flex items-center justify-center mb-6 mx-auto border border-white/10"><KeyRound className="w-6 h-6 text-orange-500" /></div>
-              <p className="text-white/50 text-xs mb-8 leading-relaxed">Insira sua Gemini API Key para habilitar o processamento.</p>
-              <div className="space-y-4">
-                <input type="password" value={manualApiKey} onChange={(e) => { setManualApiKey(e.target.value); if (error) setError(null); }} placeholder="Paste API Key here..." className="w-full bg-white/5 border border-white/10 rounded-2xl px-5 py-3.5 text-sm text-white placeholder:text-white/20 focus:outline-none focus:border-orange-500/50 transition-colors" />
-                <button onClick={handleSaveManualKey} className="w-full py-3.5 bg-orange-500 text-white text-xs font-bold tracking-widest rounded-2xl hover:bg-orange-600 transition-colors active:scale-95 flex items-center justify-center gap-2"><ShieldCheck className="w-4 h-4" /> Adicionar API</button>
-              </div>
-              <div className="mt-6"><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-xs text-white/30 hover:text-white/60 transition-colors underline underline-offset-4">Obtenha sua chave no AI Studio</a></div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       <AnimatePresence>
         {isMenuOpen && (
@@ -667,12 +625,12 @@ export default function App() {
               <AnimatePresence mode="wait">
                 {!activeMenuSection ? (
                   <motion.div key="main-menu" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} className="flex flex-col">
-                    <button onClick={() => { setStep("setup"); setIsMenuOpen(false); }} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
-                      <div className="flex items-center gap-3"><KeyRound className="w-4 h-4 text-orange-500" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Configurar API</span></div>
-                      <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
-                    </button>
                     <button onClick={() => setActiveMenuSection("criador")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
                       <div className="flex items-center gap-3"><User className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Criador</span></div>
+                      <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
+                    </button>
+                    <button onClick={() => setActiveMenuSection("historico")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
+                      <div className="flex items-center gap-3"><Eye className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Histórico</span></div>
                       <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
                     </button>
                     <button onClick={() => setActiveMenuSection("funcoes")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
@@ -683,9 +641,70 @@ export default function App() {
                       <div className="flex items-center gap-3"><WhatsAppIcon className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">WhatsApp</span></div>
                       <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
                     </a>
-                    <div className="pt-8 mt-12">
-                      <p className="text-[9px] tracking-[0.2em] text-white/10 leading-relaxed">PersonaRefine AI utiliza a tecnologia Gemini para processamento de imagem.</p>
+                    {user.email === ADMIN_EMAIL && (
+                      <>
+                        <button onClick={() => { setActiveMenuSection("config"); loadConfig(); }} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
+                          <div className="flex items-center gap-3"><Settings className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Configurações</span></div>
+                          <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
+                        </button>
+                        <button onClick={() => setActiveMenuSection("admin")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
+                          <div className="flex items-center gap-3"><LayoutDashboard className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Admin</span></div>
+                          <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
+                        </button>
+                      </>
+                    )}
+                    <div className="pt-8 mt-auto">
+                      <p className="text-[8px] tracking-[0.2em] text-white/20 mb-1 uppercase">Logado como</p>
+                      <p className="text-[10px] text-white/40 mb-4 truncate">{user.email}</p>
+                      <button
+                        onClick={async () => { await signOut(); setIsMenuOpen(false); }}
+                        className="w-full py-3 border border-red-500/20 text-red-400 text-[10px] font-bold tracking-widest rounded-xl hover:bg-red-500/10 transition-colors"
+                      >
+                        Sair da conta
+                      </button>
                     </div>
+                  </motion.div>
+                ) : activeMenuSection === "historico" ? (
+                  <motion.div key="historico" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
+                    <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><Eye className="w-5 h-5 text-orange-500" /></div>
+                    <h3 className="text-lg font-bold tracking-tighter mb-4 shrink-0">Histórico</h3>
+                    {history.length === 0 ? (
+                      <p className="text-[10px] text-white/30">Nenhuma geração ainda.</p>
+                    ) : (
+                      <div className="space-y-2 pb-4">
+                        {history.map((g) => (
+                          <div key={g.id} className="flex gap-3 bg-white/[0.03] border border-white/5 rounded-xl overflow-hidden p-2">
+                            {g.result_image_url && (
+                              <img src={g.result_image_url} alt="resultado" className="w-16 h-20 object-cover rounded-lg shrink-0" referrerPolicy="no-referrer" />
+                            )}
+                            <div className="flex flex-col flex-1 min-w-0 justify-between py-0.5">
+                              <div>
+                                <p className="text-[9px] text-white/20 mb-1">{new Date(g.created_at).toLocaleString("pt-BR")}</p>
+                                <p className="text-[10px] text-white/50 leading-relaxed line-clamp-3">{g.prompt}</p>
+                              </div>
+                              <div className="flex gap-2 mt-2">
+                                {g.result_image_url && (
+                                  <button
+                                    title="Baixar imagem"
+                                    onClick={() => downloadImage(g.result_image_url!, `retrato-${g.id.slice(0,6)}.png`)}
+                                    className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors"
+                                  >
+                                    <Download className="w-3 h-3" /> Baixar
+                                  </button>
+                                )}
+                                <button
+                                  title="Copiar prompt"
+                                  onClick={() => copyText(g.prompt)}
+                                  className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors"
+                                >
+                                  <Copy className="w-3 h-3" /> Copiar prompt
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </motion.div>
                 ) : activeMenuSection === "criador" ? (
                   <motion.div key="criador-info" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
@@ -709,6 +728,46 @@ export default function App() {
                       <div className="flex items-center justify-between text-[8px] tracking-widest text-white/20">
                         <span>Versão</span><span className="text-orange-500/50">1.0.4 Stable</span>
                       </div>
+                    </div>
+                  </motion.div>
+                ) : activeMenuSection === "admin" ? (
+                  <motion.div key="admin" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col h-full overflow-hidden">
+                    <AdminPanel />
+                  </motion.div>
+                ) : activeMenuSection === "config" ? (
+                  <motion.div key="config" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
+                    <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><Settings className="w-5 h-5 text-orange-500" /></div>
+                    <h3 className="text-lg font-bold tracking-tighter mb-1 shrink-0">Configurações</h3>
+                    <p className="text-[10px] text-white/30 mb-6">Credenciais do projeto Lovable (gateway de IA).</p>
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-[9px] tracking-widest text-white/30 mb-1.5">SUPABASE URL</label>
+                        <input
+                          value={configUrl}
+                          onChange={e => setConfigUrl(e.target.value)}
+                          placeholder="https://xxxx.supabase.co"
+                          className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-[11px] text-white/70 placeholder:text-white/20 focus:outline-none focus:border-orange-500/50"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[9px] tracking-widest text-white/30 mb-1.5">ANON KEY</label>
+                        <textarea
+                          value={configKey}
+                          onChange={e => setConfigKey(e.target.value)}
+                          placeholder="eyJhbGci..."
+                          rows={4}
+                          className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-[11px] text-white/70 placeholder:text-white/20 focus:outline-none focus:border-orange-500/50 resize-none"
+                        />
+                      </div>
+                      {configMsg && <p className={`text-[10px] ${configMsg.includes("Erro") ? "text-red-400" : "text-green-400"}`}>{configMsg}</p>}
+                      <button
+                        onClick={saveConfig}
+                        disabled={configSaving || !configUrl || !configKey}
+                        className="w-full py-3 bg-orange-500 hover:bg-orange-600 disabled:opacity-40 text-white text-[10px] font-bold tracking-widest rounded-xl transition-colors flex items-center justify-center gap-2"
+                      >
+                        {configSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                        {configSaving ? "Salvando..." : "Salvar"}
+                      </button>
                     </div>
                   </motion.div>
                 ) : (
