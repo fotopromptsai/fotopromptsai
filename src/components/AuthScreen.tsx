@@ -100,7 +100,7 @@ export default function AuthScreen() {
             if (v.currentTime >= 1) setVideoOpacity(Math.max(0, 1 - (v.currentTime - 1) / 2));
           }}
         >
-          <source src="/video.mp4" type="video/mp4" />
+          <source src="https://virzbumsdzybwnkfcisl.supabase.co/storage/v1/object/public/video/video.mp4" type="video/mp4" />
         </video>
         {/* Gradient overlay */}
         <div className="absolute inset-0 bg-gradient-to-t from-[#050505] via-[#050505]/70 to-[#050505]/30" />
