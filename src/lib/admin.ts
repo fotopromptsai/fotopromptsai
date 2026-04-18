@@ -30,16 +30,12 @@ export interface UsageStat {
 }
 
 export async function fetchAdminUsers(): Promise<AdminUser[]> {
-  const { data: profiles } = await supabaseDb
-    .from("profiles")
-    .select("id, email, created_at")
-    .order("created_at", { ascending: false });
+  const [{ data: profiles }, { data: credits }] = await Promise.all([
+    supabaseDb.from("profiles").select("id, email, created_at").order("created_at", { ascending: false }),
+    supabaseDb.from("user_credits").select("user_id, credits, last_reset"),
+  ]);
 
   if (!profiles) return [];
-
-  const { data: credits } = await supabaseDb
-    .from("user_credits")
-    .select("user_id, credits, last_reset");
 
   return profiles.map((p) => {
     const c = credits?.find((c) => c.user_id === p.id);
@@ -54,19 +50,12 @@ export async function fetchAdminUsers(): Promise<AdminUser[]> {
 }
 
 export async function fetchAdminLogs(): Promise<AdminLog[]> {
-  const { data: generations } = await supabaseDb
-    .from("generations")
-    .select("id, user_id, prompt, result_image_url, created_at")
-    .order("created_at", { ascending: false })
-    .limit(50);
+  const [{ data: generations }, { data: profiles }] = await Promise.all([
+    supabaseDb.from("generations").select("id, user_id, prompt, result_image_url, created_at").order("created_at", { ascending: false }).limit(50),
+    supabaseDb.from("profiles").select("id, email"),
+  ]);
 
   if (!generations) return [];
-
-  const userIds = [...new Set(generations.map((g) => g.user_id))];
-  const { data: profiles } = await supabaseDb
-    .from("profiles")
-    .select("id, email")
-    .in("id", userIds);
 
   return generations.map((g) => ({
     id: g.id,

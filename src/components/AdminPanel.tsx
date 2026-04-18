@@ -20,16 +20,22 @@ export default function AdminPanel() {
   const [savingCredit, setSavingCredit] = useState(false);
   const [savedId, setSavedId] = useState<string | null>(null);
 
-  const load = async () => {
+  const load = async (t: Tab = tab) => {
     setLoading(true);
-    const [u, l, s] = await Promise.all([fetchAdminUsers(), fetchAdminLogs(), fetchUsageStats()]);
-    setUsers(u);
-    setLogs(l);
-    setUsage(s);
+    if (t === "users" || t === "credits") {
+      const u = await fetchAdminUsers();
+      setUsers(u);
+    } else if (t === "logs") {
+      const l = await fetchAdminLogs();
+      setLogs(l);
+    } else if (t === "custos") {
+      const s = await fetchUsageStats();
+      setUsage(s);
+    }
     setLoading(false);
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(tab); }, [tab]);
 
   const handleSaveCredits = async (userId: string) => {
     const val = parseInt(editCredits);
@@ -61,7 +67,7 @@ export default function AdminPanel() {
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between mb-4 shrink-0">
         <h3 className="text-lg font-black tracking-tighter">Painel Admin</h3>
-        <button onClick={load} disabled={loading} className="p-1.5 rounded-lg hover:bg-white/5 text-white/30 hover:text-white/70 transition-colors">
+        <button onClick={() => load(tab)} disabled={loading} className="p-1.5 rounded-lg hover:bg-white/5 text-white/30 hover:text-white/70 transition-colors">
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
         </button>
       </div>

@@ -105,6 +105,7 @@ export default function App() {
       setUser(u);
       if (u) {
         supabaseDb.from("profiles").upsert({ id: u.id, email: u.email }).then(() => {});
+        getOrInitCredits(u.id).then(setCreditInfo);
       }
     });
     return () => subscription.unsubscribe();
