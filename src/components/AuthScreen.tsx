@@ -1,7 +1,7 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Aperture, Mail, Lock, Loader2, AlertCircle, X } from "lucide-react";
-import { signIn, signUp } from "@/src/lib/auth";
+import { signIn } from "@/src/lib/auth";
 
 type Mode = "login" | "signup";
 
@@ -15,6 +15,12 @@ export default function AuthScreen() {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [videoOpacity, setVideoOpacity] = useState(1);
+  const [badgeText, setBadgeText] = useState("Teste");
+
+  useEffect(() => {
+    const t = setTimeout(() => setBadgeText("Grátis"), 2000);
+    return () => clearTimeout(t);
+  }, []);
 
   const clearForm = () => {
     setEmail("");
@@ -63,13 +69,14 @@ export default function AuthScreen() {
         );
       }
     } else {
-      const { error: err } = await signUp(email, password);
-      if (err) {
-        setError(
-          err.message.includes("already registered")
-            ? "Este e-mail já está cadastrado."
-            : err.message
-        );
+      const resp = await fetch("/api/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const result = await resp.json();
+      if (!resp.ok) {
+        setError(result.error ?? "Erro ao criar conta. Tente novamente.");
       } else {
         setEmail("");
         setPassword("");
@@ -128,7 +135,7 @@ export default function AuthScreen() {
             </motion.div>
           </div>
           <h1 className="text-2xl font-black tracking-tight">
-            PersonaRefine <span className="text-orange-500">AI</span>
+            FotoPrompts <span className="text-orange-500">AI</span>
           </h1>
           <p className="text-white/40 text-xs tracking-widest mt-1 uppercase">
             {mode === "login" ? "Entre na sua conta" : "Crie sua conta"}
@@ -149,7 +156,14 @@ export default function AuthScreen() {
                     : "text-white/40 hover:text-white/70"
                 }`}
               >
-                {m === "login" ? "Entrar" : "Cadastrar"}
+                {m === "login" ? "Entrar" : (
+                  <span className="flex items-center justify-center gap-1.5">
+                    Cadastrar
+                    <span className="bg-green-500 text-white text-[7px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                      {badgeText}
+                    </span>
+                  </span>
+                )}
               </button>
             ))}
           </div>
@@ -245,7 +259,7 @@ export default function AuthScreen() {
         </div>
 
         <p className="text-center text-[10px] text-white/20 mt-8 tracking-widest uppercase">
-          © 2026 PersonaRefine AI
+          © 2026 FotoPrompts AI
         </p>
       </motion.div>
     </div>

@@ -10,7 +10,7 @@ export async function applyWatermark(imageUrl: string): Promise<string> {
       const ctx = canvas.getContext("2d")!;
       ctx.drawImage(img, 0, 0);
 
-      const text = "PersonaRefine AI";
+      const text = "FotoPrompts AI";
       const fontSize = Math.max(img.width * 0.038, 16);
       ctx.font = `bold ${fontSize}px sans-serif`;
 

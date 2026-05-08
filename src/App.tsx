@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { supabase, initLovableClient } from "@/src/lib/supabase";
+import { analyzeImage, analyzeFace, generateImage } from "@/src/lib/gemini";
 import { supabaseDb } from "@/src/lib/supabaseDb";
 import { signOut } from "@/src/lib/auth";
 import { getOrInitCredits, consumeCredit, type CreditInfo } from "@/src/lib/credits";
@@ -8,13 +8,14 @@ import { trackApiCall } from "@/src/lib/admin";
 import { applyWatermark } from "@/src/lib/watermark";
 import AuthScreen from "@/src/components/AuthScreen";
 import AdminPanel from "@/src/components/AdminPanel";
+import AlbumsAdmin from "@/src/components/AlbumsAdmin";
 import FaceScanOverlay from "@/src/components/FaceScanOverlay";
 import type { User as SupabaseUser } from "@supabase/supabase-js";
 import { 
-  Upload, 
-  Sparkles, 
-  ArrowRight, 
-  CheckCircle2, 
+  Upload,
+  Sparkles,
+  ArrowRight,
+  CheckCircle2,
   AlertCircle,
   User,
   Camera,
@@ -30,7 +31,7 @@ import {
   MessageCircle,
   ScanSearch,
   Loader2,
-  Wand2,
+  FileText,
   Download,
   RotateCcw,
   Eye,
@@ -55,6 +56,8 @@ const WhatsAppIcon = ({ className }: { className?: string }) => (
 
 // Types
 type Step = "reference" | "prompt" | "user-image" | "result";
+type View = "gerar" | "historico" | "albums" | "admin";
+type GerarMode = null | "referencia" | "direto";
 
 interface AnalysisResult {
   prompt: string;
@@ -82,6 +85,8 @@ export default function App() {
   const [isScanning, setIsScanning] = useState<"reference" | "user" | null>(null);
   const [error, setError] = useState<{ message: string; type?: "api" | "size" | "gen" | "auth" } | null>(null);
   const [isCopied, setIsCopied] = useState<boolean>(false);
+  const [view, setView] = useState<View>("gerar");
+  const [gerarMode, setGerarMode] = useState<GerarMode>(null);
   const [isMenuOpen, setIsMenuOpen] = useState<boolean>(false);
   const [activeMenuSection, setActiveMenuSection] = useState<string | null>(null);
   const [configUrl, setConfigUrl] = useState("");
@@ -90,12 +95,6 @@ export default function App() {
   const [configMsg, setConfigMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    // Carrega credenciais Lovable exclusivamente da tabela app_config
-    supabaseDb.from("app_config").select("lovable_url, lovable_anon_key").eq("id", 1).single().then(({ data }) => {
-      if (data?.lovable_url && data?.lovable_anon_key) {
-        initLovableClient(data.lovable_url, data.lovable_anon_key);
-      }
-    });
 
     supabaseDb.auth.getSession().then(({ data }) => {
       setUser(data.session?.user ?? null);
@@ -169,14 +168,7 @@ export default function App() {
     setIsScanning("reference");
 
     try {
-      const { data, error: fnError } = await supabase.functions.invoke("analyze-image", {
-        body: { imageBase64: referenceImage, mode: "fiel" },
-      });
-
-      if (fnError) throw fnError;
-
-      const promptData = data?.versions?.[0] ?? data?.prompts?.[0];
-      if (!promptData) throw new Error("A IA não retornou um prompt estruturado.");
+      const promptData = await analyzeImage(referenceImage);
 
       const fullPrompt = `${promptData.base} ${promptData.facePreservation} Pose: ${promptData.pose} Outfit: ${promptData.outfit} Background: ${promptData.background} Lighting: ${promptData.lighting} Camera: ${promptData.camera}`;
 
@@ -233,15 +225,8 @@ export default function App() {
     setIsScanning("user");
 
     try {
-      const { data, error: fnError } = await supabase.functions.invoke("generate-photoshoot", {
-        body: { prompt: generatedPrompt, userImageBase64: userImage },
-      });
-
-      if (fnError) {
-        console.error("Edge Function error detail:", JSON.stringify(fnError), data);
-        throw fnError;
-      }
-      if (!data?.imageUrl) throw new Error("A IA não gerou uma imagem.");
+      const faceDescription = await analyzeFace(userImage!);
+      const imageUrl = await generateImage(generatedPrompt, userImage!, referenceImage!, faceDescription);
 
       // Só desconta crédito após sucesso confirmado
       await consumeCredit(user.id);
@@ -249,10 +234,10 @@ export default function App() {
       setCreditInfo(updated);
       trackApiCall(user.id, "generate", import.meta.env.VITE_SUPABASE_URL ?? "");
 
-      setFinalImage(data.imageUrl);
-      const wm = await applyWatermark(data.imageUrl);
+      setFinalImage(imageUrl);
+      const wm = await applyWatermark(imageUrl);
       setWatermarkedImage(wm);
-      await saveGeneration(user.id, generatedPrompt, data.imageUrl);
+      await saveGeneration(user.id, generatedPrompt, imageUrl);
       fetchHistory(user.id).then(setHistory);
       setStep("result");
     } catch (err: any) {
@@ -335,6 +320,7 @@ export default function App() {
     setFinalImage(null);
     setWatermarkedImage(null);
     setStep("reference");
+    setGerarMode(null);
   };
 
   const copyToClipboard = async () => {
@@ -380,7 +366,7 @@ export default function App() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-900/10 blur-[120px] rounded-full" />
       </div>
 
-      <header className="relative z-10 border-b border-white/5 backdrop-blur-md bg-black/20">
+      <header className="fixed top-0 left-0 right-0 z-[100] border-b border-white/5 backdrop-blur-md bg-[#050505]/90">
         <div className="max-w-5xl mx-auto p-6 flex justify-between items-center">
           <div className="flex flex-col gap-0.5">
             <div className="flex items-center gap-3">
@@ -397,7 +383,7 @@ export default function App() {
                   <Aperture className="w-10 h-10 text-orange-500 relative z-10" />
                 </motion.div>
               </div>
-              <h1 className="text-xl font-bold tracking-tight">PersonaRefine <span className="text-orange-500">AI</span></h1>
+              <h1 className="text-xl font-bold tracking-tight">FotoPrompts <span className="text-orange-500">AI</span></h1>
             </div>
           </div>
           <div className="flex items-center gap-4 relative">
@@ -420,20 +406,125 @@ export default function App() {
         </div>
       </header>
 
-      <main className="relative z-10 max-w-5xl mx-auto p-6 pt-12">
+      <main className="relative z-10 max-w-5xl mx-auto p-6 pt-24 pb-28">
+        {/* Histórico view */}
+        {view === "historico" && (
+          <motion.div key="historico-view" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+            <h2 className="text-2xl font-black tracking-tighter mb-6">Histórico</h2>
+            {history.length === 0 ? (
+              <p className="text-[11px] text-white/30 text-center py-12">Nenhuma geração ainda.</p>
+            ) : (
+              <div className="space-y-2">
+                {history.map((g) => (
+                  <div key={g.id} className="flex gap-3 bg-white/[0.03] border border-white/5 rounded-xl overflow-hidden p-2">
+                    {g.result_image_url && (
+                      <img src={g.result_image_url} alt="" className="w-16 h-20 object-cover rounded-lg shrink-0" referrerPolicy="no-referrer" />
+                    )}
+                    <div className="flex flex-col flex-1 min-w-0 justify-between py-0.5">
+                      <div>
+                        <p className="text-[9px] text-white/20 mb-1">{new Date(g.created_at).toLocaleString("pt-BR")}</p>
+                        <p className="text-[10px] text-white/50 leading-relaxed line-clamp-3">{g.prompt}</p>
+                      </div>
+                      <div className="flex gap-3 mt-2">
+                        {g.result_image_url && (
+                          <button onClick={() => downloadImage(g.result_image_url!, `retrato-${g.id.slice(0,6)}.png`)} className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors">
+                            <Download className="w-3 h-3" /> Baixar
+                          </button>
+                        )}
+                        <button onClick={() => copyText(g.prompt)} className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors">
+                          <Copy className="w-3 h-3" /> Copiar prompt
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        )}
+
+        {/* Albums view */}
+        {view === "albums" && (
+          <motion.div key="albums-view" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+            <h2 className="text-2xl font-black tracking-tighter mb-6">Álbuns</h2>
+            <AlbumsAdmin userId={user.id} />
+          </motion.div>
+        )}
+
+        {/* Admin view */}
+        {view === "admin" && user.email === ADMIN_EMAIL && (
+          <motion.div key="admin-view" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+            <AdminPanel />
+          </motion.div>
+        )}
+
+        {/* Gerar view */}
+        {view === "gerar" && (
         <AnimatePresence mode="wait">
-          {step === "reference" && (
-            <motion.div 
+
+          {/* Tela de escolha do modo */}
+          {!gerarMode && step === "reference" && (
+            <motion.div
+              key="choose-mode"
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -12 }}
+              className="flex flex-col gap-4"
+            >
+              <div className="mb-2">
+                <p className="text-[10px] tracking-[0.3em] text-orange-500 font-bold uppercase mb-3">Novo Ensaio</p>
+                <h2 className="text-4xl md:text-6xl font-black tracking-tighter uppercase text-white leading-none">Por onde<br />começar?</h2>
+              </div>
+
+              <div className="flex flex-col gap-3 w-full mt-2">
+                {/* Card referência */}
+                <button
+                  onClick={() => setGerarMode("referencia")}
+                  className="group relative overflow-hidden rounded-2xl text-left transition-all duration-200 hover:scale-[1.01] active:scale-[0.99] flex items-center gap-5 p-5"
+                >
+                  <div className="absolute inset-0 bg-gradient-to-r from-orange-600 to-orange-500" />
+                  <div className="relative z-10 w-14 h-14 bg-white/15 rounded-2xl flex items-center justify-center shrink-0">
+                    <Camera className="w-7 h-7 text-white" />
+                  </div>
+                  <div className="relative z-10 flex-1 text-left">
+                    <span className="text-[9px] font-bold tracking-[0.25em] text-orange-200/60 block mb-0.5">01 — RECOMENDADO</span>
+                    <h3 className="text-lg font-black tracking-tight text-white leading-tight">Analisar Referência</h3>
+                    <p className="text-[11px] text-white/60 leading-relaxed mt-0.5">Envie uma foto, a IA extrai pose, iluminação e estilo.</p>
+                  </div>
+                  <ArrowRight className="relative z-10 w-5 h-5 text-white/50 shrink-0 group-hover:text-white transition-colors" />
+                </button>
+
+                {/* Card já tenho prompt */}
+                <button
+                  onClick={() => { setGerarMode("direto"); setStep("prompt"); }}
+                  className="group relative overflow-hidden rounded-2xl text-left bg-white/[0.04] border border-white/10 hover:border-white/20 hover:bg-white/[0.07] transition-all duration-200 hover:scale-[1.01] active:scale-[0.99] flex items-center gap-5 p-5"
+                >
+                  <div className="w-14 h-14 bg-white/8 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-orange-500/15 transition-colors">
+                    <FileText className="w-7 h-7 text-white/40 group-hover:text-orange-400 transition-colors" />
+                  </div>
+                  <div className="flex-1 text-left">
+                    <span className="text-[9px] font-bold tracking-[0.25em] text-white/20 block mb-0.5">02 — TENHO MEU PROMPT</span>
+                    <h3 className="text-lg font-black tracking-tight text-white leading-tight">Já tenho Prompt</h3>
+                    <p className="text-[11px] text-white/40 leading-relaxed mt-0.5 group-hover:text-white/55 transition-colors">Cole ou escreva seu prompt e gere direto.</p>
+                  </div>
+                  <ArrowRight className="w-5 h-5 text-white/20 shrink-0 group-hover:text-white/50 transition-colors" />
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {gerarMode === "referencia" && step === "reference" && (
+            <motion.div
               key="reference-base"
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 1.05 }}
-              className={cn(
-                "grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12 items-center transition-all duration-500",
-                ""
-              )}
+              className="grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12 items-center"
             >
               <div>
+                <button onClick={reset} className="flex items-center gap-1.5 text-[10px] text-white/30 hover:text-white/60 mb-5 transition-colors">
+                  <ChevronLeft className="w-3.5 h-3.5" /> Voltar
+                </button>
                 <span className="text-orange-500 text-xs font-bold uppercase tracking-[0.3em] mb-4 block">Passo 01</span>
                 <h2 className="text-4xl md:text-6xl font-black mb-6 tracking-tighter leading-[0.9] uppercase text-white">Foto de Referência</h2>
                 <p className="text-white/50 text-base md:text-lg mb-8 leading-relaxed">
@@ -483,14 +574,25 @@ export default function App() {
             </motion.div>
           )}
 
-          {step === "prompt" && analysisDetails && (
+          {step === "prompt" && (gerarMode === "direto" || analysisDetails) && (
             <motion.div key="prompt" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="max-w-4xl mx-auto">
               <div className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
                 <div>
-                  <span className="text-orange-500 text-xs font-bold uppercase tracking-[0.3em] mb-2 block">Passo 02</span>
-                  <h2 className="text-3xl md:text-4xl font-black tracking-tighter uppercase">Prompt Gerado</h2>
+                  <button onClick={reset} className="flex items-center gap-1.5 text-[10px] text-white/30 hover:text-white/60 mb-3 transition-colors">
+                    <ChevronLeft className="w-3.5 h-3.5" /> Voltar
+                  </button>
+                  <span className="text-orange-500 text-xs font-bold uppercase tracking-[0.3em] mb-2 block">
+                    {gerarMode === "direto" ? "Passo 01" : "Passo 02"}
+                  </span>
+                  <h2 className="text-3xl md:text-4xl font-black tracking-tighter uppercase">
+                    {gerarMode === "direto" ? "Seu Prompt" : "Prompt Gerado"}
+                  </h2>
                 </div>
-                <button onClick={() => setStep("user-image")} className="px-6 py-3 bg-zinc-900 border border-orange-500/30 rounded-full text-sm font-bold tracking-widest hover:bg-orange-500/10 flex items-center gap-2">
+                <button
+                  onClick={() => setStep("user-image")}
+                  disabled={!generatedPrompt.trim()}
+                  className="px-6 py-3 bg-zinc-900 border border-orange-500/30 rounded-full text-sm font-bold tracking-widest hover:bg-orange-500/10 disabled:opacity-30 flex items-center gap-2"
+                >
                   Próximo passo <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
@@ -499,20 +601,30 @@ export default function App() {
                 <div className="lg:col-span-2 space-y-6">
                   <div className="bg-white/5 border border-white/10 rounded-2xl p-6 relative">
                     <div className="flex items-center justify-between mb-4">
-                      <label className="text-[10px] uppercase tracking-[0.3em] text-white/40 block">Prompt</label>
+                      <label className="text-[10px] uppercase tracking-[0.3em] text-white/40 block">
+                        {gerarMode === "direto" ? "Cole ou escreva seu prompt" : "Prompt"}
+                      </label>
                       <button onClick={copyToClipboard} className="text-[10px] uppercase tracking-widest text-orange-500 hover:text-orange-400 flex items-center gap-2">
-                        {isCopied ? "Copiado!" : "Copiar Prompt"} {isCopied ? <Check className="w-3" /> : <Copy className="w-3" />}
+                        {isCopied ? "Copiado!" : "Copiar"} {isCopied ? <Check className="w-3" /> : <Copy className="w-3" />}
                       </button>
                     </div>
-                    <textarea value={generatedPrompt} readOnly className="w-full h-64 bg-transparent border-none text-white/80 leading-relaxed resize-none font-mono text-sm" />
+                    <textarea
+                      value={generatedPrompt}
+                      onChange={(e) => setGeneratedPrompt(e.target.value)}
+                      readOnly={gerarMode === "referencia"}
+                      placeholder={gerarMode === "direto" ? "Ex: A professional portrait photo of a woman in golden hour light, bokeh background, 85mm lens..." : undefined}
+                      className="w-full h-64 bg-transparent border-none text-white/80 leading-relaxed resize-none font-mono text-sm focus:outline-none placeholder:text-white/20"
+                    />
                   </div>
                 </div>
 
-                <div className="space-y-6">
-                  <div className="aspect-[3/4] rounded-2xl overflow-hidden border border-white/10 opacity-50 filter grayscale">
-                    <img src={referenceImage!} alt="Ref" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                {referenceImage && (
+                  <div className="space-y-6">
+                    <div className="aspect-[3/4] rounded-2xl overflow-hidden border border-white/10 opacity-50 filter grayscale">
+                      <img src={referenceImage} alt="Ref" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             </motion.div>
           )}
@@ -554,7 +666,7 @@ export default function App() {
                 </div>
                 {userImage && (
                   <button onClick={generateFinalImage} disabled={isLoading} className="relative z-30 w-full mt-6 py-4 bg-orange-500 text-white font-bold tracking-widest rounded-xl hover:bg-orange-600 flex items-center justify-center gap-2">
-                    {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wand2 className="w-5 h-5" />}
+                    {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
                     {isLoading ? "Gerando..." : "Gerar retrato"}
                   </button>
                 )}
@@ -566,7 +678,7 @@ export default function App() {
             <motion.div key="result" initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} className="flex flex-col items-center">
               <div className="mb-8 md:mb-12 text-center text-white">
                 <span className="text-orange-500 text-xs font-bold uppercase tracking-[0.3em] mb-4 block">Resultado Final</span>
-                <h2 className="text-4xl md:text-7xl font-black tracking-tighter uppercase leading-none">Refinado</h2>
+                <h2 className="text-4xl md:text-7xl font-black tracking-tighter uppercase leading-none">Gerado</h2>
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-4 gap-8 w-full">
@@ -590,70 +702,88 @@ export default function App() {
                 </div>
 
                 <div className="space-y-6">
-                  <div className="bg-white/5 border border-white/10 rounded-2xl p-6">
-                    <h4 className="text-[10px] uppercase tracking-widest text-white/40 mb-4">Referência Usada</h4>
-                    <div className="aspect-[3/4] rounded-lg overflow-hidden grayscale opacity-30">
-                      <img src={referenceImage!} alt="Reference" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  {referenceImage && (
+                    <div className="bg-white/5 border border-white/10 rounded-2xl p-6">
+                      <h4 className="text-[10px] uppercase tracking-widest text-white/40 mb-4">Referência Usada</h4>
+                      <div className="aspect-[3/4] rounded-lg overflow-hidden grayscale opacity-30">
+                        <img src={referenceImage} alt="Reference" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                      </div>
                     </div>
-                  </div>
-                  <div className="bg-white/5 border border-white/10 rounded-2xl p-6">
-                    <h4 className="text-[10px] uppercase tracking-widest text-white/40 mb-4">Foto Original</h4>
-                    <div className="aspect-[3/4] rounded-lg overflow-hidden grayscale opacity-30">
-                      <img src={userImage!} alt="Original" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  )}
+                  {userImage && (
+                    <div className="bg-white/5 border border-white/10 rounded-2xl p-6">
+                      <h4 className="text-[10px] uppercase tracking-widest text-white/40 mb-4">Foto Original</h4>
+                      <div className="aspect-[3/4] rounded-lg overflow-hidden grayscale opacity-30">
+                        <img src={userImage} alt="Original" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               </div>
             </motion.div>
           )}
         </AnimatePresence>
+        )}
       </main>
 
-
-      <footer className="relative z-10 p-8 border-t border-white/5 flex justify-center items-center">
-        <p className="text-[10px] uppercase tracking-[0.3em] text-white/20 text-center">© 2026 PersonaRefine AI</p>
-      </footer>
+      {/* Bottom Navigation */}
+      <nav className="fixed bottom-0 left-0 right-0 z-[200] bg-[#050505] border-t border-white/8 flex items-center justify-around">
+        <button
+          onClick={() => setView("gerar")}
+          className={`flex flex-col items-center gap-1.5 py-4 px-6 transition-colors ${view === "gerar" ? "text-orange-500" : "text-white/30 hover:text-white/60"}`}
+        >
+          <Aperture className="w-6 h-6" />
+          <span className="text-[10px] font-bold tracking-widest">GERAR</span>
+        </button>
+        <button
+          onClick={() => setView("historico")}
+          className={`flex flex-col items-center gap-1.5 py-4 px-6 transition-colors ${view === "historico" ? "text-orange-500" : "text-white/30 hover:text-white/60"}`}
+        >
+          <Eye className="w-6 h-6" />
+          <span className="text-[10px] font-bold tracking-widest">HISTÓRICO</span>
+        </button>
+        <button
+          onClick={() => setView("albums")}
+          className={`flex flex-col items-center gap-1.5 py-4 px-6 transition-colors ${view === "albums" ? "text-orange-500" : "text-white/30 hover:text-white/60"}`}
+        >
+          <Layers className="w-6 h-6" />
+          <span className="text-[10px] font-bold tracking-widest">ÁLBUNS</span>
+        </button>
+        {user.email === ADMIN_EMAIL && (
+          <button
+            onClick={() => setView("admin")}
+            className={`flex flex-col items-center gap-1.5 py-4 px-6 transition-colors ${view === "admin" ? "text-orange-500" : "text-white/30 hover:text-white/60"}`}
+          >
+            <LayoutDashboard className="w-6 h-6" />
+            <span className="text-[10px] font-bold tracking-widest">ADMIN</span>
+          </button>
+        )}
+      </nav>
 
       <AnimatePresence>
         {isMenuOpen && (
           <>
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setIsMenuOpen(false)} className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[201]" />
-            <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 25 }} className="fixed top-0 right-0 bottom-0 w-[70%] md:w-1/2 bg-[#0a0a0a] border-l border-white/10 z-[202] shadow-2xl p-8 flex flex-col">
+            <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed top-0 right-0 bottom-0 w-[70%] md:w-1/2 bg-[#0a0a0a] border-l border-white/10 z-[202] shadow-2xl p-8 flex flex-col">
               <div className="flex justify-between items-center mb-8">
                 {activeMenuSection && <button onClick={() => setActiveMenuSection(null)} className="flex items-center gap-2 p-2 hover:bg-white/5 rounded-full transition-colors group"><ChevronLeft className="w-4 h-4 text-white/40 group-hover:text-orange-500" /></button>}
                 <button onClick={() => { setIsMenuOpen(false); setActiveMenuSection(null); }} className="p-2 hover:bg-white/5 rounded-full transition-colors"><X className="w-5 h-5 text-white/40" /></button>
               </div>
               <AnimatePresence mode="wait">
                 {!activeMenuSection ? (
-                  <motion.div key="main-menu" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} className="flex flex-col">
+                  <motion.div key="main-menu" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.1 }} className="flex flex-col">
                     <button onClick={() => setActiveMenuSection("criador")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
                       <div className="flex items-center gap-3"><User className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Criador</span></div>
-                      <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
-                    </button>
-                    <button onClick={() => setActiveMenuSection("historico")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
-                      <div className="flex items-center gap-3"><Eye className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Histórico</span></div>
                       <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
                     </button>
                     <button onClick={() => setActiveMenuSection("funcoes")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
                       <div className="flex items-center gap-3"><Cpu className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Funções</span></div>
                       <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
                     </button>
-                    <a href="https://wa.me/5515992568868?text=Olá Leoclécio, gostaria de saber mais sobre o PersonaRefine AI." target="_blank" rel="noopener noreferrer" className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
+                    <a href="https://wa.me/5515992568868?text=Olá Leoclécio, gostaria de saber mais sobre o FotoPrompts AI." target="_blank" rel="noopener noreferrer" className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
                       <div className="flex items-center gap-3"><WhatsAppIcon className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">WhatsApp</span></div>
                       <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
                     </a>
-                    {user.email === ADMIN_EMAIL && (
-                      <>
-                        <button onClick={() => { setActiveMenuSection("config"); loadConfig(); }} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
-                          <div className="flex items-center gap-3"><Settings className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Configurações</span></div>
-                          <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
-                        </button>
-                        <button onClick={() => setActiveMenuSection("admin")} className="w-full flex items-center justify-between py-4 border-b border-white/5 hover:pl-2 transition-all group">
-                          <div className="flex items-center gap-3"><LayoutDashboard className="w-4 h-4 text-white/40 group-hover:text-orange-500 transition-colors" /><span className="text-[10px] font-bold tracking-[0.2em] text-white/60 group-hover:text-white transition-colors">Admin</span></div>
-                          <ArrowRight className="w-3 h-3 text-white/20 group-hover:text-orange-500 transition-colors" />
-                        </button>
-                      </>
-                    )}
                     <div className="pt-8 mt-auto">
                       <p className="text-[8px] tracking-[0.2em] text-white/20 mb-1 uppercase">Logado como</p>
                       <p className="text-[10px] text-white/40 mb-4 truncate">{user.email}</p>
@@ -665,53 +795,11 @@ export default function App() {
                       </button>
                     </div>
                   </motion.div>
-                ) : activeMenuSection === "historico" ? (
-                  <motion.div key="historico" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
-                    <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><Eye className="w-5 h-5 text-orange-500" /></div>
-                    <h3 className="text-lg font-bold tracking-tighter mb-4 shrink-0">Histórico</h3>
-                    {history.length === 0 ? (
-                      <p className="text-[10px] text-white/30">Nenhuma geração ainda.</p>
-                    ) : (
-                      <div className="space-y-2 pb-4">
-                        {history.map((g) => (
-                          <div key={g.id} className="flex gap-3 bg-white/[0.03] border border-white/5 rounded-xl overflow-hidden p-2">
-                            {g.result_image_url && (
-                              <img src={g.result_image_url} alt="resultado" className="w-16 h-20 object-cover rounded-lg shrink-0" referrerPolicy="no-referrer" />
-                            )}
-                            <div className="flex flex-col flex-1 min-w-0 justify-between py-0.5">
-                              <div>
-                                <p className="text-[9px] text-white/20 mb-1">{new Date(g.created_at).toLocaleString("pt-BR")}</p>
-                                <p className="text-[10px] text-white/50 leading-relaxed line-clamp-3">{g.prompt}</p>
-                              </div>
-                              <div className="flex gap-2 mt-2">
-                                {g.result_image_url && (
-                                  <button
-                                    title="Baixar imagem"
-                                    onClick={() => downloadImage(g.result_image_url!, `retrato-${g.id.slice(0,6)}.png`)}
-                                    className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors"
-                                  >
-                                    <Download className="w-3 h-3" /> Baixar
-                                  </button>
-                                )}
-                                <button
-                                  title="Copiar prompt"
-                                  onClick={() => copyText(g.prompt)}
-                                  className="flex items-center gap-1 text-[9px] text-white/40 hover:text-orange-400 transition-colors"
-                                >
-                                  <Copy className="w-3 h-3" /> Copiar prompt
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </motion.div>
                 ) : activeMenuSection === "criador" ? (
-                  <motion.div key="criador-info" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
+                  <motion.div key="criador-info" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.1 }} className="flex flex-col overflow-y-auto scrollbar-hide">
                     <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><User className="w-5 h-5 text-orange-500" /></div>
                     <h3 className="text-lg font-bold tracking-tighter mb-3 shrink-0">Desenvolvimento</h3>
-                    <p className="text-[11px] text-white/60 leading-relaxed mb-4">PersonaRefine AI foi concebido e desenvolvido por <span className="text-orange-500">Leoclécio Ambrosio</span>.</p>
+                    <p className="text-[11px] text-white/60 leading-relaxed mb-4">FotoPrompts AI foi concebido e desenvolvido por <span className="text-orange-500">Leoclécio Ambrosio</span>.</p>
                     <div className="space-y-3 mb-6">
                       <div>
                         <span className="block text-[8px] tracking-widest text-white/20 mb-1">Contato</span>
@@ -731,48 +819,8 @@ export default function App() {
                       </div>
                     </div>
                   </motion.div>
-                ) : activeMenuSection === "admin" ? (
-                  <motion.div key="admin" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col h-full overflow-hidden">
-                    <AdminPanel />
-                  </motion.div>
-                ) : activeMenuSection === "config" ? (
-                  <motion.div key="config" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
-                    <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><Settings className="w-5 h-5 text-orange-500" /></div>
-                    <h3 className="text-lg font-bold tracking-tighter mb-1 shrink-0">Configurações</h3>
-                    <p className="text-[10px] text-white/30 mb-6">Credenciais do projeto Lovable (gateway de IA).</p>
-                    <div className="space-y-4">
-                      <div>
-                        <label className="block text-[9px] tracking-widest text-white/30 mb-1.5">SUPABASE URL</label>
-                        <input
-                          value={configUrl}
-                          onChange={e => setConfigUrl(e.target.value)}
-                          placeholder="https://xxxx.supabase.co"
-                          className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-[11px] text-white/70 placeholder:text-white/20 focus:outline-none focus:border-orange-500/50"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[9px] tracking-widest text-white/30 mb-1.5">ANON KEY</label>
-                        <textarea
-                          value={configKey}
-                          onChange={e => setConfigKey(e.target.value)}
-                          placeholder="eyJhbGci..."
-                          rows={4}
-                          className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-[11px] text-white/70 placeholder:text-white/20 focus:outline-none focus:border-orange-500/50 resize-none"
-                        />
-                      </div>
-                      {configMsg && <p className={`text-[10px] ${configMsg.includes("Erro") ? "text-red-400" : "text-green-400"}`}>{configMsg}</p>}
-                      <button
-                        onClick={saveConfig}
-                        disabled={configSaving || !configUrl || !configKey}
-                        className="w-full py-3 bg-orange-500 hover:bg-orange-600 disabled:opacity-40 text-white text-[10px] font-bold tracking-widest rounded-xl transition-colors flex items-center justify-center gap-2"
-                      >
-                        {configSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-                        {configSaving ? "Salvando..." : "Salvar"}
-                      </button>
-                    </div>
-                  </motion.div>
                 ) : (
-                  <motion.div key="funcoes-info" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="flex flex-col overflow-y-auto scrollbar-hide">
+                  <motion.div key="funcoes-info" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.1 }} className="flex flex-col overflow-y-auto scrollbar-hide">
                     <div className="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center border border-orange-500/20 mb-4 shrink-0"><Cpu className="w-5 h-5 text-orange-500" /></div>
                     <h3 className="text-lg font-bold tracking-tighter mb-4 shrink-0">Capacidades do Sistema</h3>
                     <div className="space-y-6 pb-4">
